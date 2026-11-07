@@ -1,17 +1,20 @@
 const { Pool } = require('pg');
 
+if (!process.env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is missing. Connect Location 2 to its own PostgreSQL database.');
+}
+
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-const FREE_ACCOUNT_LOCK_THRESHOLD = 50;
 const LOCK_HOUR = 20;
 const LOCK_MINUTE = 0;
 const UNLOCK_HOUR = 4;
 const UNLOCK_MINUTE = 0;
-const REMOVE_PASSWORD = '1234';
+const REMOVE_PASSWORD = process.env.REMOVE_PASSWORD || '1234';
 const HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
 const TIMEZONE = 'Africa/Lusaka';
 
@@ -21,18 +24,14 @@ async function initDB() {
             phone TEXT PRIMARY KEY,
             password TEXT NOT NULL,
             status TEXT DEFAULT 'FREE',
-            logout_time BIGINT DEFAULT NULL,
-            logout_time_str TEXT DEFAULT NULL,
-            last_heartbeat BIGINT DEFAULT NULL,
-            in_use_since BIGINT DEFAULT NULL,
-            tab_id TEXT DEFAULT NULL,
-            freed_at BIGINT DEFAULT NULL
-        );
+            logout_time BIGINT,
+            logout_time_str TEXT,
+            last_heartbeat BIGINT,
+            in_use_since BIGINT,
+            tab_id TEXT,
+            freed_at BIGINT
+        )
     `);
-
-    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS in_use_since BIGINT DEFAULT NULL;`);
-    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS tab_id TEXT DEFAULT NULL;`);
-    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS freed_at BIGINT DEFAULT NULL;`);
 
     await pool.query(`
         CREATE TABLE IF NOT EXISTS alerts (
@@ -41,7 +40,7 @@ async function initDB() {
             amount NUMERIC DEFAULT 0,
             timestamp BIGINT,
             created_at TIMESTAMP DEFAULT NOW()
-        );
+        )
     `);
 
     await pool.query(`
@@ -50,7 +49,7 @@ async function initDB() {
             password TEXT,
             reported_at TEXT,
             status TEXT DEFAULT 'BAD_PASSWORD'
-        );
+        )
     `);
 
     await pool.query(`
@@ -58,13 +57,13 @@ async function initDB() {
             phone TEXT PRIMARY KEY,
             password TEXT NOT NULL,
             status TEXT DEFAULT 'FREE',
-            logout_time BIGINT DEFAULT NULL,
-            logout_time_str TEXT DEFAULT NULL,
-            last_heartbeat BIGINT DEFAULT NULL,
-            in_use_since BIGINT DEFAULT NULL,
-            tab_id TEXT DEFAULT NULL,
-            freed_at BIGINT DEFAULT NULL
-        );
+            logout_time BIGINT,
+            logout_time_str TEXT,
+            last_heartbeat BIGINT,
+            in_use_since BIGINT,
+            tab_id TEXT,
+            freed_at BIGINT
+        )
     `);
 
     await pool.query(`
@@ -74,7 +73,7 @@ async function initDB() {
             amount NUMERIC DEFAULT 0,
             timestamp BIGINT,
             created_at TIMESTAMP DEFAULT NOW()
-        );
+        )
     `);
 
     await pool.query(`
@@ -83,111 +82,91 @@ async function initDB() {
             password TEXT,
             reported_at TEXT,
             status TEXT DEFAULT 'BAD_PASSWORD'
-        );
+        )
     `);
 
-    console.log('Location 2 database tables are ready. Account pools start empty.');
+    for (const table of ['accounts', 'gsb_accounts']) {
+        await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS in_use_since BIGINT`);
+        await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS tab_id TEXT`);
+        await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS freed_at BIGINT`);
+    }
+
+    console.log('Location 2 database initialized. Both pools are empty.');
 }
 
-function makeStore(T, B) {
+function makeStore(table, badTable) {
     async function getAccounts() {
-        const { rows } = await pool.query(`SELECT * FROM ${T} ORDER BY phone ASC`);
+        const { rows } = await pool.query(
+            `SELECT * FROM ${table} ORDER BY phone ASC`
+        );
+
         return rows.map(r => ({
             phone: r.phone,
             password: r.password,
             status: r.status,
-            logoutTime: r.logout_time ? Number(r.logout_time) : null,
+            logoutTime: r.logout_time == null ? null : Number(r.logout_time),
             logoutTimeStr: r.logout_time_str,
-            lastHeartbeat: r.last_heartbeat ? Number(r.last_heartbeat) : null,
-            inUseSince: r.in_use_since ? Number(r.in_use_since) : null,
-            tabId: r.tab_id || null,
-            freedAt: r.freed_at ? Number(r.freed_at) : null
+            lastHeartbeat: r.last_heartbeat == null ? null : Number(r.last_heartbeat),
+            inUseSince: r.in_use_since == null ? null : Number(r.in_use_since),
+            tabId: r.tab_id,
+            freedAt: r.freed_at == null ? null : Number(r.freed_at)
         }));
     }
 
     async function getAccountByTabId(tabId) {
         const { rows } = await pool.query(
-            `SELECT * FROM ${T}
-             WHERE tab_id = $1 AND status = 'IN-USE'
-             AND logout_time IS NULL LIMIT 1`,
+            `SELECT * FROM ${table}
+             WHERE tab_id=$1 AND status='IN-USE' AND logout_time IS NULL
+             LIMIT 1`,
             [tabId]
         );
 
         if (!rows.length) return null;
-
         const r = rows[0];
+
         return {
             phone: r.phone,
             password: r.password,
             status: r.status,
-            logoutTime: r.logout_time ? Number(r.logout_time) : null,
+            logoutTime: r.logout_time == null ? null : Number(r.logout_time),
             logoutTimeStr: r.logout_time_str,
-            lastHeartbeat: r.last_heartbeat ? Number(r.last_heartbeat) : null,
-            inUseSince: r.in_use_since ? Number(r.in_use_since) : null,
-            tabId: r.tab_id || null,
-            freedAt: r.freed_at ? Number(r.freed_at) : null
+            lastHeartbeat: r.last_heartbeat == null ? null : Number(r.last_heartbeat),
+            inUseSince: r.in_use_since == null ? null : Number(r.in_use_since),
+            tabId: r.tab_id,
+            freedAt: r.freed_at == null ? null : Number(r.freed_at)
         };
     }
 
-    async function reLoginForTab(tabId, heartbeatNow, logoutTimeStr) {
+    async function claimFreeAccount(tabId, now) {
         const client = await pool.connect();
 
         try {
             await client.query('BEGIN');
 
-            if (tabId) {
-                const { rows: oldRows } = await client.query(
-                    `SELECT phone FROM ${T}
-                     WHERE tab_id = $1 AND status = 'IN-USE'
-                     AND logout_time IS NULL
-                     LIMIT 1 FOR UPDATE SKIP LOCKED`,
-                    [tabId]
-                );
-
-                if (oldRows.length) {
-                    await client.query(
-                        `UPDATE ${T}
-                         SET logout_time = $2,
-                             logout_time_str = $3,
-                             last_heartbeat = NULL,
-                             in_use_since = NULL,
-                             tab_id = NULL
-                         WHERE phone = $1`,
-                        [oldRows[0].phone, heartbeatNow, logoutTimeStr + ' (re-login)']
-                    );
-                }
-            }
-
-            const { rows: newRows } = await client.query(
-                `SELECT phone, password FROM ${T}
-                 WHERE status = 'FREE'
+            const { rows } = await client.query(
+                `SELECT phone,password FROM ${table}
+                 WHERE status='FREE'
                  ORDER BY freed_at ASC NULLS LAST
                  LIMIT 1 FOR UPDATE SKIP LOCKED`
             );
 
-            if (!newRows.length) {
+            if (!rows.length) {
                 await client.query('ROLLBACK');
                 return null;
             }
 
-            const { phone, password } = newRows[0];
+            const account = rows[0];
 
             await client.query(
-                `UPDATE ${T}
-                 SET status = 'IN-USE',
-                     logout_time = NULL,
-                     logout_time_str = NULL,
-                     last_heartbeat = $2,
-                     in_use_since = $2,
-                     tab_id = $3,
-                     freed_at = NULL
-                 WHERE phone = $1`,
-                [phone, heartbeatNow, tabId || null]
+                `UPDATE ${table}
+                 SET status='IN-USE', logout_time=NULL, logout_time_str=NULL,
+                     last_heartbeat=$2, in_use_since=$2, tab_id=$3, freed_at=NULL
+                 WHERE phone=$1`,
+                [account.phone, now, tabId]
             );
 
             await client.query('COMMIT');
-            return { phone, password };
-
+            return account;
         } catch (e) {
             await client.query('ROLLBACK');
             throw e;
@@ -196,44 +175,55 @@ function makeStore(T, B) {
         }
     }
 
-    async function claimFreeAccount(heartbeatNow, tabId) {
+    async function reLoginForTab(tabId, now, timeText) {
         const client = await pool.connect();
 
         try {
             await client.query('BEGIN');
 
-            const { rows } = await client.query(`
-                SELECT phone, password
-                FROM ${T}
-                WHERE status = 'FREE'
-                ORDER BY freed_at ASC NULLS LAST
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            `);
+            if (tabId) {
+                const { rows: old } = await client.query(
+                    `SELECT phone FROM ${table}
+                     WHERE tab_id=$1 AND status='IN-USE' AND logout_time IS NULL
+                     LIMIT 1 FOR UPDATE SKIP LOCKED`,
+                    [tabId]
+                );
+
+                if (old.length) {
+                    await client.query(
+                        `UPDATE ${table}
+                         SET logout_time=$2, logout_time_str=$3,
+                             last_heartbeat=NULL, in_use_since=NULL, tab_id=NULL
+                         WHERE phone=$1`,
+                        [old[0].phone, now, timeText + ' (re-login)']
+                    );
+                }
+            }
+
+            const { rows } = await client.query(
+                `SELECT phone,password FROM ${table}
+                 WHERE status='FREE'
+                 ORDER BY freed_at ASC NULLS LAST
+                 LIMIT 1 FOR UPDATE SKIP LOCKED`
+            );
 
             if (!rows.length) {
                 await client.query('ROLLBACK');
                 return null;
             }
 
-            const { phone, password } = rows[0];
+            const account = rows[0];
 
             await client.query(
-                `UPDATE ${T}
-                 SET status = 'IN-USE',
-                     logout_time = NULL,
-                     logout_time_str = NULL,
-                     last_heartbeat = $2,
-                     in_use_since = $2,
-                     tab_id = $3,
-                     freed_at = NULL
-                 WHERE phone = $1`,
-                [phone, heartbeatNow, tabId || null]
+                `UPDATE ${table}
+                 SET status='IN-USE', logout_time=NULL, logout_time_str=NULL,
+                     last_heartbeat=$2, in_use_since=$2, tab_id=$3, freed_at=NULL
+                 WHERE phone=$1`,
+                [account.phone, now, tabId]
             );
 
             await client.query('COMMIT');
-            return { phone, password };
-
+            return account;
         } catch (e) {
             await client.query('ROLLBACK');
             throw e;
@@ -243,11 +233,11 @@ function makeStore(T, B) {
     }
 
     async function updateAccount(phone, fields) {
-        const map = {
+        const columns = {
+            status: 'status',
             logoutTime: 'logout_time',
             logoutTimeStr: 'logout_time_str',
             lastHeartbeat: 'last_heartbeat',
-            status: 'status',
             inUseSince: 'in_use_since',
             tabId: 'tab_id',
             freedAt: 'freed_at'
@@ -256,46 +246,46 @@ function makeStore(T, B) {
         const keys = Object.keys(fields);
         if (!keys.length) return;
 
-        const setClauses = keys.map((k, i) => `${map[k]} = $${i + 1}`).join(', ');
-        const values = [...keys.map(k => fields[k]), phone];
+        const sets = keys.map((key, i) => {
+            if (!columns[key]) throw new Error('Invalid account field: ' + key);
+            return `${columns[key]}=$${i + 1}`;
+        });
+
+        const values = keys.map(key => fields[key]);
+        values.push(phone);
 
         await pool.query(
-            `UPDATE ${T} SET ${setClauses} WHERE phone = $${values.length}`,
+            `UPDATE ${table} SET ${sets.join(', ')} WHERE phone=$${values.length}`,
             values
         );
     }
 
     async function addAccount(phone, password) {
         await pool.query(
-            `INSERT INTO ${T} (phone, password, status)
-             VALUES ($1, $2, 'FREE')`,
+            `INSERT INTO ${table} (phone,password,status)
+             VALUES ($1,$2,'FREE')`,
             [phone, password]
         );
     }
 
     async function removeAccount(phone) {
-        await pool.query(`DELETE FROM ${T} WHERE phone = $1`, [phone]);
+        await pool.query(`DELETE FROM ${table} WHERE phone=$1`, [phone]);
     }
 
     async function resetAllAccounts() {
-        await pool.query(`
-            UPDATE ${T}
-            SET status = 'FREE',
-                logout_time = NULL,
-                logout_time_str = NULL,
-                last_heartbeat = NULL,
-                in_use_since = NULL,
-                tab_id = NULL,
-                freed_at = NULL
-        `);
+        await pool.query(
+            `UPDATE ${table}
+             SET status='FREE', logout_time=NULL, logout_time_str=NULL,
+                 last_heartbeat=NULL, in_use_since=NULL, tab_id=NULL, freed_at=NULL`
+        );
     }
 
     async function deleteAllAccounts() {
-        await pool.query(`DELETE FROM ${T}`);
+        await pool.query(`DELETE FROM ${table}`);
     }
 
     async function getBadPasswordAccounts() {
-        const { rows } = await pool.query(`SELECT * FROM ${B}`);
+        const { rows } = await pool.query(`SELECT * FROM ${badTable}`);
         return rows.map(r => ({
             phone: r.phone,
             password: r.password,
@@ -306,22 +296,21 @@ function makeStore(T, B) {
 
     async function addBadPasswordAccount(phone, password, reportedAt) {
         await pool.query(
-            `INSERT INTO ${B} (phone, password, reported_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT DO NOTHING`,
+            `INSERT INTO ${badTable} (phone,password,reported_at)
+             VALUES ($1,$2,$3) ON CONFLICT (phone) DO NOTHING`,
             [phone, password, reportedAt]
         );
     }
 
     async function removeBadPasswordAccount(phone) {
-        await pool.query(`DELETE FROM ${B} WHERE phone = $1`, [phone]);
+        await pool.query(`DELETE FROM ${badTable} WHERE phone=$1`, [phone]);
     }
 
     return {
         getAccounts,
         getAccountByTabId,
-        reLoginForTab,
         claimFreeAccount,
+        reLoginForTab,
         updateAccount,
         addAccount,
         removeAccount,
@@ -337,15 +326,20 @@ const mwos = makeStore('accounts', 'bad_password_accounts');
 const gsb = makeStore('gsb_accounts', 'gsb_bad_password_accounts');
 
 function getZambiaTime() {
-    const now = new Date();
-    const zambiaStr = now.toLocaleString('en-GB', { timeZone: TIMEZONE });
-    const [, timePart] = zambiaStr.split(', ');
-    const [hours, minutes, seconds] = timePart.split(':').map(Number);
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: TIMEZONE,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hourCycle: 'h23'
+    }).formatToParts(new Date());
+
+    const get = type => Number(parts.find(p => p.type === type).value);
 
     return {
-        hour: hours,
-        minute: minutes,
-        second: seconds
+        hour: get('hour'),
+        minute: get('minute'),
+        second: get('second')
     };
 }
 
@@ -354,21 +348,8 @@ module.exports = {
     initDB,
     mwos,
     gsb,
-    getAccounts: mwos.getAccounts,
-    getAccountByTabId: mwos.getAccountByTabId,
-    claimFreeAccount: mwos.claimFreeAccount,
-    reLoginForTab: mwos.reLoginForTab,
-    updateAccount: mwos.updateAccount,
-    addAccount: mwos.addAccount,
-    removeAccount: mwos.removeAccount,
-    resetAllAccounts: mwos.resetAllAccounts,
-    deleteAllAccounts: mwos.deleteAllAccounts,
-    getBadPasswordAccounts: mwos.getBadPasswordAccounts,
-    addBadPasswordAccount: mwos.addBadPasswordAccount,
-    removeBadPasswordAccount: mwos.removeBadPasswordAccount,
     getZambiaTime,
     TWENTY_FOUR_HOURS_MS,
-    FREE_ACCOUNT_LOCK_THRESHOLD,
     LOCK_HOUR,
     LOCK_MINUTE,
     UNLOCK_HOUR,
