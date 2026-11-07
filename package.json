@@ -1,7 +1,7 @@
 {
   "name": "login-pool-server-21",
   "version": "1.0.0",
-  "description": "Independent Location 2 Login Pool Manager",
+  "description": "Independent Location 2 account pool manager",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
