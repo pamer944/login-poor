@@ -1,391 +1,219 @@
-const { Pool } = require('pg');
+const express = require('express');
+const {
+    pool, initDB, mwos, gsb,
+    getZambiaTime, TWENTY_FOUR_HOURS_MS,
+    LOCK_HOUR, LOCK_MINUTE, UNLOCK_HOUR, UNLOCK_MINUTE,
+    REMOVE_PASSWORD, HEARTBEAT_TIMEOUT_MS, TIMEZONE
+} = require('./accounts');
 
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
 });
 
-const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-const FREE_ACCOUNT_LOCK_THRESHOLD = 50;
-
-const LOCK_HOUR = 20;
-const LOCK_MINUTE = 0;
-const UNLOCK_HOUR = 4;
-const UNLOCK_MINUTE = 0;
-
-const REMOVE_PASSWORD = process.env.REMOVE_PASSWORD || '1234';
-const HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
-const TIMEZONE = 'Africa/Lusaka';
-
-async function initDB() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS accounts (
-            phone TEXT PRIMARY KEY,
-            password TEXT NOT NULL,
-            status TEXT DEFAULT 'FREE',
-            logout_time BIGINT DEFAULT NULL,
-            logout_time_str TEXT DEFAULT NULL,
-            last_heartbeat BIGINT DEFAULT NULL,
-            in_use_since BIGINT DEFAULT NULL,
-            tab_id TEXT DEFAULT NULL,
-            freed_at BIGINT DEFAULT NULL
-        );
-    `);
-
-    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS in_use_since BIGINT DEFAULT NULL;`);
-    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS tab_id TEXT DEFAULT NULL;`);
-    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS freed_at BIGINT DEFAULT NULL;`);
-
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS alerts (
-            id SERIAL PRIMARY KEY,
-            tab_id TEXT,
-            amount NUMERIC DEFAULT 0,
-            timestamp BIGINT,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    `);
-
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS bad_password_accounts (
-            phone TEXT PRIMARY KEY,
-            password TEXT,
-            reported_at TEXT,
-            status TEXT DEFAULT 'BAD_PASSWORD'
-        );
-    `);
-
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS gsb_accounts (
-            phone TEXT PRIMARY KEY,
-            password TEXT NOT NULL,
-            status TEXT DEFAULT 'FREE',
-            logout_time BIGINT DEFAULT NULL,
-            logout_time_str TEXT DEFAULT NULL,
-            last_heartbeat BIGINT DEFAULT NULL,
-            in_use_since BIGINT DEFAULT NULL,
-            tab_id TEXT DEFAULT NULL,
-            freed_at BIGINT DEFAULT NULL
-        );
-    `);
-
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS gsb_alerts (
-            id SERIAL PRIMARY KEY,
-            tab_id TEXT,
-            amount NUMERIC DEFAULT 0,
-            timestamp BIGINT,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    `);
-
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS gsb_bad_password_accounts (
-            phone TEXT PRIMARY KEY,
-            password TEXT,
-            reported_at TEXT,
-            status TEXT DEFAULT 'BAD_PASSWORD'
-        );
-    `);
-
-    // Location 2 starts with empty account pools.
-    console.log('Location 2 database initialized.');
+function pad(n) {
+    return String(n).padStart(2, '0');
 }
 
-function makeStore(T, B) {
-    async function getAccounts() {
-        const { rows } = await pool.query(`SELECT * FROM ${T} ORDER BY phone ASC`);
+function checkLockStatus(hour, minute) {
+    const t = hour * 60 + minute;
+    const start = LOCK_HOUR * 60 + LOCK_MINUTE;
+    const end = UNLOCK_HOUR * 60 + UNLOCK_MINUTE;
+    const locked = start <= end
+        ? t >= start && t < end
+        : t >= start || t < end;
 
-        return rows.map(r => ({
-            phone: r.phone,
-            password: r.password,
-            status: r.status,
-            logoutTime: r.logout_time ? Number(r.logout_time) : null,
-            logoutTimeStr: r.logout_time_str,
-            lastHeartbeat: r.last_heartbeat ? Number(r.last_heartbeat) : null,
-            inUseSince: r.in_use_since ? Number(r.in_use_since) : null,
-            tabId: r.tab_id || null,
-            freedAt: r.freed_at ? Number(r.freed_at) : null
-        }));
-    }
+    return {
+        shouldLock: locked,
+        isWorkingHours: !locked,
+        isLowAccounts: false
+    };
+}
 
-    async function getAccountByTabId(tabId) {
-        const { rows } = await pool.query(
-            `SELECT * FROM ${T}
-             WHERE tab_id = $1 AND status = 'IN-USE'
-             AND logout_time IS NULL LIMIT 1`,
-            [tabId]
-        );
+const HEARTBEAT_SILENCE_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 
-        if (rows.length === 0) return null;
-
-        const r = rows[0];
-
-        return {
-            phone: r.phone,
-            password: r.password,
-            status: r.status,
-            logoutTime: r.logout_time ? Number(r.logout_time) : null,
-            logoutTimeStr: r.logout_time_str,
-            lastHeartbeat: r.last_heartbeat ? Number(r.last_heartbeat) : null,
-            inUseSince: r.in_use_since ? Number(r.in_use_since) : null,
-            tabId: r.tab_id || null,
-            freedAt: r.freed_at ? Number(r.freed_at) : null
-        };
-    }
-
-    async function reLoginForTab(tabId, heartbeatNow, logoutTimeStr) {
-        const client = await pool.connect();
-
+function registerAddAccount(path) {
+    app.post(path, async (req, res) => {
         try {
-            await client.query('BEGIN');
+            const { phone, password } = req.body;
+            if (!phone || !password) {
+                return res.json({ success: false, error: 'Phone and password required.' });
+            }
 
-            if (tabId) {
-                const { rows: oldRows } = await client.query(
-                    `SELECT phone FROM ${T}
-                     WHERE tab_id = $1 AND status = 'IN-USE'
-                     AND logout_time IS NULL
-                     LIMIT 1 FOR UPDATE SKIP LOCKED`,
-                    [tabId]
-                );
+            const inMwos = (await mwos.getAccounts()).some(a => a.phone === phone);
+            const inGsb = (await gsb.getAccounts()).some(a => a.phone === phone);
 
-                if (oldRows.length > 0) {
-                    await client.query(
-                        `UPDATE ${T}
-                         SET logout_time = $2,
-                             logout_time_str = $3,
-                             last_heartbeat = NULL,
-                             in_use_since = NULL,
-                             tab_id = NULL
-                         WHERE phone = $1`,
-                        [
-                            oldRows[0].phone,
-                            heartbeatNow,
-                            logoutTimeStr + ' (re-login)'
-                        ]
-                    );
+            if (inMwos && inGsb) {
+                return res.json({ success: false, error: 'Account already exists.' });
+            }
+
+            if (!inMwos) await mwos.addAccount(phone, password);
+            if (!inGsb) await gsb.addAccount(phone, password);
+
+            res.json({ success: true });
+        } catch (e) {
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+}
+
+registerAddAccount('/add-account');
+registerAddAccount('/gsb/add-account');
+
+async function setupPool(name, base, store, alertsTable) {
+    let poolLocked = false;
+    let poolLockedReason = '';
+
+    // Automatically return accounts to FREE after 24 hours.
+    setInterval(async () => {
+        try {
+            const accounts = await store.getAccounts();
+            const now = Date.now();
+
+            for (const acc of accounts) {
+                if (
+                    acc.status === 'IN-USE' &&
+                    acc.logoutTime &&
+                    now - acc.logoutTime >= TWENTY_FOUR_HOURS_MS
+                ) {
+                    await store.updateAccount(acc.phone, {
+                        status: 'FREE',
+                        logoutTime: null,
+                        logoutTimeStr: null,
+                        lastHeartbeat: null,
+                        inUseSince: null,
+                        tabId: null,
+                        freedAt: now
+                    });
+                }
+            }
+        } catch (e) {
+            console.error('Auto-free error:', e);
+        }
+    }, 60000);
+
+    // Heartbeat timeout: only after a real heartbeat has arrived.
+    setInterval(async () => {
+        try {
+            const accounts = await store.getAccounts();
+            const now = Date.now();
+
+            for (const acc of accounts) {
+                if (
+                    acc.status === 'IN-USE' &&
+                    !acc.logoutTime &&
+                    acc.lastHeartbeat &&
+                    acc.inUseSince &&
+                    acc.lastHeartbeat > acc.inUseSince &&
+                    now - acc.lastHeartbeat > HEARTBEAT_TIMEOUT_MS
+                ) {
+                    const { hour, minute } = getZambiaTime();
+
+                    await store.updateAccount(acc.phone, {
+                        logoutTime: Date.now(),
+                        logoutTimeStr: pad(hour) + ':' + pad(minute) + ' (tab closed)',
+                        inUseSince: null,
+                        tabId: null
+                    });
+                }
+            }
+        } catch (e) {
+            console.error('Heartbeat check error:', e);
+        }
+    }, 10000);
+
+    // Three-hour no-heartbeat fallback.
+    setInterval(async () => {
+        try {
+            const accounts = await store.getAccounts();
+            const now = Date.now();
+
+            for (const acc of accounts) {
+                if (
+                    acc.status === 'IN-USE' &&
+                    !acc.logoutTime &&
+                    acc.lastHeartbeat &&
+                    now - acc.lastHeartbeat > HEARTBEAT_SILENCE_TIMEOUT_MS
+                ) {
+                    const { hour, minute } = getZambiaTime();
+
+                    await store.updateAccount(acc.phone, {
+                        logoutTime: Date.now(),
+                        logoutTimeStr: pad(hour) + ':' + pad(minute) + ' (3h no heartbeat)',
+                        inUseSince: null,
+                        tabId: null
+                    });
+                }
+            }
+        } catch (e) {
+            console.error('Timeout check error:', e);
+        }
+    }, 60000);
+
+    // Scheduled lock and unlock.
+    setInterval(async () => {
+        try {
+            const { hour, minute } = getZambiaTime();
+            const { shouldLock } = checkLockStatus(hour, minute);
+
+            if (shouldLock && !poolLocked) {
+                poolLocked = true;
+                poolLockedReason = 'Locked at 20:00. Unlocks at 04:00.';
+                console.log('[' + name + '] Pool locked.');
+            } else if (!shouldLock && poolLocked) {
+                poolLocked = false;
+                poolLockedReason = '';
+                console.log('[' + name + '] Pool unlocked.');
+            }
+        } catch (e) {
+            console.error('Lock check error:', e);
+        }
+    }, 10000);
+
+    // 21:00 sweep: move active accounts into Waiting.
+    let lastSweepDate = null;
+
+    setInterval(async () => {
+        try {
+            const { hour } = getZambiaTime();
+            if (hour !== 21) return;
+
+            const today = new Date().toLocaleDateString('en-CA', {
+                timeZone: TIMEZONE
+            });
+
+            if (lastSweepDate === today) return;
+
+            const accounts = await store.getAccounts();
+            const { hour: h, minute: m } = getZambiaTime();
+            const timeStr = pad(h) + ':' + pad(m);
+            let moved = 0;
+
+            for (const acc of accounts) {
+                if (acc.status === 'IN-USE' && !acc.logoutTime) {
+                    await store.updateAccount(acc.phone, {
+                        logoutTime: Date.now(),
+                        logoutTimeStr: timeStr + ' (21:00 sweep)',
+                        lastHeartbeat: null,
+                        inUseSince: null,
+                        tabId: null
+                    });
+                    moved++;
                 }
             }
 
-            const { rows: newRows } = await client.query(
-                `SELECT phone, password FROM ${T}
-                 WHERE status = 'FREE'
-                 ORDER BY freed_at ASC NULLS LAST
-                 LIMIT 1 FOR UPDATE SKIP LOCKED`
-            );
-
-            if (newRows.length === 0) {
-                await client.query('ROLLBACK');
-                return null;
-            }
-
-            const { phone, password } = newRows[0];
-
-            await client.query(
-                `UPDATE ${T}
-                 SET status = 'IN-USE',
-                     logout_time = NULL,
-                     logout_time_str = NULL,
-                     last_heartbeat = $2,
-                     in_use_since = $2,
-                     tab_id = $3,
-                     freed_at = NULL
-                 WHERE phone = $1`,
-                [phone, heartbeatNow, tabId || null]
-            );
-
-            await client.query('COMMIT');
-
-            return { phone, password };
-
+            lastSweepDate = today;
+            console.log('[' + name + '] 21:00 sweep moved ' + moved + ' account(s).');
         } catch (e) {
-            await client.query('ROLLBACK');
-            throw e;
-        } finally {
-            client.release();
+            console.error('Sweep error:', e);
         }
-    }
+    }, 30000);
 
-    async function claimFreeAccount(heartbeatNow, tabId) {
-        const client = await pool.connect();
-
-        try {
-            await client.query('BEGIN');
-
-            const { rows } = await client.query(`
-                SELECT phone, password FROM ${T}
-                WHERE status = 'FREE'
-                ORDER BY freed_at ASC NULLS LAST
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            `);
-
-            if (rows.length === 0) {
-                await client.query('ROLLBACK');
-                return null;
-            }
-
-            const { phone, password } = rows[0];
-
-            await client.query(
-                `UPDATE ${T}
-                 SET status = 'IN-USE',
-                     logout_time = NULL,
-                     logout_time_str = NULL,
-                     last_heartbeat = $2,
-                     in_use_since = $2,
-                     tab_id = $3,
-                     freed_at = NULL
-                 WHERE phone = $1`,
-                [phone, heartbeatNow, tabId || null]
-            );
-
-            await client.query('COMMIT');
-
-            return { phone, password };
-
-        } catch (e) {
-            await client.query('ROLLBACK');
-            throw e;
-        } finally {
-            client.release();
-        }
-    }
-
-    async function updateAccount(phone, fields) {
-        const map = {
-            logoutTime: 'logout_time',
-            logoutTimeStr: 'logout_time_str',
-            lastHeartbeat: 'last_heartbeat',
-            status: 'status',
-            inUseSince: 'in_use_since',
-            tabId: 'tab_id',
-            freedAt: 'freed_at'
-        };
-
-        const keys = Object.keys(fields);
-
-        if (!keys.length) return;
-
-        const setClauses = keys.map((k, i) => `${map[k]} = $${i + 1}`).join(', ');
-        const values = [...keys.map(k => fields[k]), phone];
-
-        await pool.query(
-            `UPDATE ${T} SET ${setClauses} WHERE phone = $${values.length}`,
-            values
-        );
-    }
-
-    async function addAccount(phone, password) {
-        await pool.query(
-            `INSERT INTO ${T} (phone, password, status)
-             VALUES ($1, $2, 'FREE')`,
-            [phone, password]
-        );
-    }
-
-    async function removeAccount(phone) {
-        await pool.query(`DELETE FROM ${T} WHERE phone = $1`, [phone]);
-    }
-
-    async function resetAllAccounts() {
-        await pool.query(
-            `UPDATE ${T}
-             SET status = 'FREE',
-                 logout_time = NULL,
-                 logout_time_str = NULL,
-                 last_heartbeat = NULL,
-                 in_use_since = NULL,
-                 tab_id = NULL,
-                 freed_at = NULL`
-        );
-    }
-
-    async function deleteAllAccounts() {
-        await pool.query(`DELETE FROM ${T}`);
-    }
-
-    async function getBadPasswordAccounts() {
-        const { rows } = await pool.query(`SELECT * FROM ${B}`);
-
-        return rows.map(r => ({
-            phone: r.phone,
-            password: r.password,
-            reportedAt: r.reported_at,
-            status: r.status
-        }));
-    }
-
-    async function addBadPasswordAccount(phone, password, reportedAt) {
-        await pool.query(
-            `INSERT INTO ${B} (phone, password, reported_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT DO NOTHING`,
-            [phone, password, reportedAt]
-        );
-    }
-
-    async function removeBadPasswordAccount(phone) {
-        await pool.query(`DELETE FROM ${B} WHERE phone = $1`, [phone]);
-    }
-
-    return {
-        getAccounts,
-        getAccountByTabId,
-        reLoginForTab,
-        claimFreeAccount,
-        updateAccount,
-        addAccount,
-        removeAccount,
-        resetAllAccounts,
-        deleteAllAccounts,
-        getBadPasswordAccounts,
-        addBadPasswordAccount,
-        removeBadPasswordAccount
-    };
-}
-
-const mwos = makeStore('accounts', 'bad_password_accounts');
-const gsb = makeStore('gsb_accounts', 'gsb_bad_password_accounts');
-
-function getZambiaTime() {
-    const now = new Date();
-    const zambiaStr = now.toLocaleString('en-GB', { timeZone: TIMEZONE });
-    const [, timePart] = zambiaStr.split(', ');
-    const [hours, minutes, seconds] = timePart.split(':').map(Number);
-
-    return {
-        hour: hours,
-        minute: minutes,
-        second: seconds
-    };
-}
-
-module.exports = {
-    pool,
-    initDB,
-    mwos,
-    gsb,
-    getAccounts: mwos.getAccounts,
-    getAccountByTabId: mwos.getAccountByTabId,
-    claimFreeAccount: mwos.claimFreeAccount,
-    reLoginForTab: mwos.reLoginForTab,
-    updateAccount: mwos.updateAccount,
-    addAccount: mwos.addAccount,
-    removeAccount: mwos.removeAccount,
-    resetAllAccounts: mwos.resetAllAccounts,
-    deleteAllAccounts: mwos.deleteAllAccounts,
-    getBadPasswordAccounts: mwos.getBadPasswordAccounts,
-    addBadPasswordAccount: mwos.addBadPasswordAccount,
-    removeBadPasswordAccount: mwos.removeBadPasswordAccount,
-    getZambiaTime,
-    TWENTY_FOUR_HOURS_MS,
-    FREE_ACCOUNT_LOCK_THRESHOLD,
-    LOCK_HOUR,
-    LOCK_MINUTE,
-    UNLOCK_HOUR,
-    UNLOCK_MINUTE,
-    REMOVE_PASSWORD,
-    HEARTBEAT_TIMEOUT_MS,
-    TIMEZONE
-};
+    // API endpoints continue in Part 2.
