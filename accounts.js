@@ -210,7 +210,7 @@ function makeStore(T, B) {
     }
 
     async function updateAccount(phone, fields) {
-        const map = { logoutTime: 'logout_time', logoutTimeStr: 'logout_time_str', lastHeartbeat: 'last_heartbeat', status: 'status', inUseSince: 'in_use_since', tabId: 'tab_id', freedAt: 'freed_at' };
+        const map = { logoutTime: 'logout_time', logoutTimeStr: 'logout_time_str', lastHeartbeat: 'last_heartbeat', status: 'status', inUseSince: 'in_use_since', tabId: 'tab_id', freedAt: 'freed_at', password: 'password' };
         const keys = Object.keys(fields);
         const setClauses = keys.map((k, i) => `${map[k]} = $${i + 1}`).join(', ');
         const values = [...keys.map(k => fields[k]), phone];
