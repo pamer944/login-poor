@@ -136,6 +136,29 @@ app.get('/migrate-password-now', async (req, res) => {
 async function setupPool(name, base, store, alertsTable) {
     let poolLocked = false;
     let poolLockedReason = '';
+    let manualLock = false;
+    let timeLocked = false;
+
+    function applyLockState(isTimeLocked) {
+        timeLocked = isTimeLocked;
+        const shouldLock = isTimeLocked || manualLock;
+
+        if (shouldLock) {
+            const reason = isTimeLocked
+                ? 'Locked at 20:00. Unlocks at 04:00.'
+                : 'Locked manually.';
+
+            if (!poolLocked || poolLockedReason !== reason) {
+                poolLocked = true;
+                poolLockedReason = reason;
+                console.log('[' + name + '] Pool locked:', reason);
+            }
+        } else if (poolLocked) {
+            poolLocked = false;
+            poolLockedReason = '';
+            console.log('[' + name + '] Pool unlocked.');
+        }
+    }
 
     setInterval(async () => {
         try {
@@ -227,30 +250,8 @@ async function setupPool(name, base, store, alertsTable) {
     setInterval(async () => {
         try {
             const { hour, minute } = getZambiaTime();
-            const accounts = await store.getAccounts();
-            const freeCount = accounts.filter(a => a.status === 'FREE').length;
-
-            const {
-                shouldLock,
-                isLowAccounts
-            } = checkLockStatus(hour, minute, freeCount);
-
-            if (shouldLock) {
-                if (!poolLocked) {
-                    poolLocked = true;
-                    poolLockedReason = isLowAccounts
-                        ? `Low accounts (${freeCount}). Locked until 04:00.`
-                        : 'Locked at 20:00. Unlocks at 04:00.';
-
-                    console.log('Pool locked:', poolLockedReason);
-                }
-            } else {
-                if (poolLocked) {
-                    poolLocked = false;
-                    poolLockedReason = '';
-                    console.log('Pool unlocked.');
-                }
-            }
+            const { shouldLock } = checkLockStatus(hour, minute, 0);
+            applyLockState(shouldLock);
         } catch (e) {
             console.error('lock-check error:', e);
         }
@@ -311,7 +312,9 @@ async function setupPool(name, base, store, alertsTable) {
                 waiting: accounts.filter(a => a.status === 'IN-USE' && a.logoutTime).length,
                 badPassword: badPasswordAccounts.length,
                 locked: poolLocked,
-                reason: poolLockedReason
+                reason: poolLockedReason,
+                manualLock: manualLock,
+                timeLocked: timeLocked
             });
 
         } catch (e) {
@@ -627,11 +630,43 @@ async function setupPool(name, base, store, alertsTable) {
             await store.resetAllAccounts();
             poolLocked = false;
             poolLockedReason = '';
+            manualLock = false;
 
             res.json({ success: true });
 
         } catch (e) {
             res.status(500).json({ success: false });
+        }
+    });
+
+    app.post(base + '/toggle-lock', async (req, res) => {
+        try {
+            const { pin, lock } = req.body || {};
+
+            if (pin !== REMOVE_PASSWORD) {
+                return res.json({
+                    success: false,
+                    error: 'Incorrect PIN.'
+                });
+            }
+
+            manualLock = typeof lock === 'boolean' ? lock : !manualLock;
+
+            const { hour, minute } = getZambiaTime();
+            applyLockState(checkLockStatus(hour, minute, 0).shouldLock);
+
+            res.json({
+                success: true,
+                manualLock: manualLock,
+                locked: poolLocked,
+                reason: poolLockedReason
+            });
+
+        } catch (e) {
+            res.status(500).json({
+                success: false,
+                error: e.message
+            });
         }
     });
 
@@ -1245,6 +1280,9 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 .pill{padding:6px 14px;border-radius:20px;font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px}
 .pill-live{background:#0d4429;color:#3fb950}
 .pill-locked{background:#4b1111;color:#f87171}
+.top-right{display:flex;align-items:center;gap:8px}
+.lock-btn{background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:6px 12px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer}
+.lock-btn.on{background:#4b1111;border-color:#7f1d1d;color:#f87171}
 .dot{width:7px;height:7px;border-radius:50%;animation:blink 1.2s infinite}
 .dot-live{background:#3fb950}
 .dot-locked{background:#f87171}
@@ -1305,9 +1343,12 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 
 <div class="top-bar">
     <div class="db-title">&#128274; ${name} pool</div>
-    <div id="pill" class="pill ${poolLocked ? 'pill-locked' : 'pill-live'}">
-        <div class="dot ${poolLocked ? 'dot-locked' : 'dot-live'}"></div>
-        <span id="pill-text">${poolLocked ? 'Locked' : 'Live'}</span>
+    <div class="top-right">
+        <button id="lock-btn" class="lock-btn ${manualLock ? 'on' : ''}">${manualLock ? '&#128275; Unlock' : '&#128274; Lock'}</button>
+        <div id="pill" class="pill ${poolLocked ? 'pill-locked' : 'pill-live'}">
+            <div class="dot ${poolLocked ? 'dot-locked' : 'dot-live'}"></div>
+            <span id="pill-text">${poolLocked ? 'Locked' : 'Live'}</span>
+        </div>
     </div>
 </div>
 
@@ -1321,7 +1362,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
         <div class="bl ${poolLocked ? 'c-locked' : 'c-free'}" id="free-label">${poolLocked ? '&#128274; Locked' : '&#10003; Free'}</div>
         <div class="bn ${poolLocked ? 'c-locked' : 'c-free'}" id="num-free">${freeAccounts.length}</div>
         <div class="bd ${poolLocked ? 'd-locked' : 'd-free'}" id="free-desc">${poolLocked ? poolLockedReason : 'Accounts ready'}</div>
-        <div id="unlock-block" style="display:${poolLocked ? 'block' : 'none'}">
+        <div id="unlock-block" style="display:${timeLocked ? 'block' : 'none'}">
             <div class="unlock-t" id="unlock-countdown">--:--:--</div>
             <div class="unlock-s">Unlocks at 04:00 (Zambia)</div>
         </div>
@@ -1450,6 +1491,8 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
                 var freeDesc = document.getElementById('free-desc');
                 var unlockBlock = document.getElementById('unlock-block');
 
+                updateLockBtn(d.manualLock);
+
                 if (d.locked) {
                     pill.className = 'pill pill-locked';
                     pill.querySelector('.dot').className = 'dot dot-locked';
@@ -1461,7 +1504,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
                     freeNum.className = 'bn c-locked';
                     freeDesc.className = 'bd d-locked';
                     freeDesc.textContent = d.reason;
-                    unlockBlock.style.display = 'block';
+                    unlockBlock.style.display = d.timeLocked ? 'block' : 'none';
 
                     var now = new Date();
                     var h = now.getUTCHours() + 2;
@@ -1505,6 +1548,47 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
             })
             .catch(function() {});
     }
+
+    var manualLockOn = ${manualLock ? 'true' : 'false'};
+
+    function updateLockBtn(on) {
+        manualLockOn = !!on;
+        var btn = document.getElementById('lock-btn');
+        btn.className = 'lock-btn' + (manualLockOn ? ' on' : '');
+        btn.innerHTML = manualLockOn ? '&#128275; Unlock' : '&#128274; Lock';
+    }
+
+    document.getElementById('lock-btn').addEventListener('click', function() {
+        var wantLock = !manualLockOn;
+        var pin = prompt('Enter PIN to ' + (wantLock ? 'LOCK' : 'UNLOCK') + ' free accounts:');
+
+        if (!pin) return;
+
+        fetch('${base}/toggle-lock', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                pin: pin,
+                lock: wantLock
+            })
+        })
+        .then(function(r) {
+            return r.json();
+        })
+        .then(function(d) {
+            if (d.success) {
+                updateLockBtn(d.manualLock);
+                refreshStats();
+            } else {
+                alert(d.error || 'Error');
+            }
+        })
+        .catch(function() {
+            alert('Network error');
+        });
+    });
 
     setInterval(refreshStats, 2000);
     refreshStats();
@@ -1899,19 +1983,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     // Startup lock check for this pool
 
     const { hour, minute } = getZambiaTime();
-    const startAccounts = await store.getAccounts();
-    const startFree = startAccounts.filter(a => a.status === 'FREE').length;
-    const startLock = checkLockStatus(hour, minute, startFree);
-
-    if (startLock.shouldLock) {
-        poolLocked = true;
-
-        poolLockedReason = startLock.isLowAccounts
-            ? `Low accounts (${startFree}). Locked until 04:00.`
-            : 'Locked at 20:00. Unlocks at 04:00.';
-
-        console.log('[' + name + '] Startup lock:', poolLockedReason);
-    }
+    applyLockState(checkLockStatus(hour, minute, 0).shouldLock);
 }
 
 initDB().then(async function() {
