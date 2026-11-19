@@ -59,7 +59,7 @@ function registerAddAccount(path) {
 
             phone = String(phone).trim().replace(/\s+/g, '');
             if (phone.startsWith('0')) phone = phone.substring(1);
-            if (!/^[79]\d{8}$/.test(phone)) {
+            if (!/^[579]\d{8}$/.test(phone)) {
                 return res.json({
                     success: false,
                     error: 'Phone must be 9 digits, e.g. 975232003.'
@@ -1624,7 +1624,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 
         phone = phone.replace(/\\s+/g, '');
         if (phone.charAt(0) === '0') phone = phone.substring(1);
-        if (!/^[79]\\d{8}$/.test(phone)) {
+        if (!/^[579]\\d{8}$/.test(phone)) {
             showMsg('Phone must be 9 digits, e.g. 975232003', false);
             return;
         }
