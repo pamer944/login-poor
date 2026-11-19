@@ -1431,6 +1431,13 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     <a href="${base}/view/all" class="vbtn">View all <span class="vcnt" id="cnt-total">${freeAccounts.length + inUseAccounts.length + waitingAccounts.length}</span></a>
 </div>
 
+<div class="box box-bad" id="bad-box" style="margin-bottom:16px">
+    <div class="bl c-bad">&#9888;&#65039; Invalid login</div>
+    <div class="bn c-bad" id="num-bad">${badPasswordAccounts.length}</div>
+    <div class="bd d-bad">Phone or password invalid</div>
+    <a href="${base}/view/bad" class="vbtn">View <span class="vcnt" id="cnt-bad">${badPasswordAccounts.length}</span></a>
+</div>
+
 <div class="add-box">
     <div class="add-title">&#43; Add account</div>
     <div class="add-row">
@@ -1533,6 +1540,9 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
                 var total = (d.free || 0) + (d.inUse || 0) + (d.waiting || 0);
                 var nt = document.getElementById('num-total'); if (nt) nt.textContent = total;
                 var ct = document.getElementById('cnt-total'); if (ct) ct.textContent = total;
+
+                var nb = document.getElementById('num-bad'); if (nb) nb.textContent = d.badPassword;
+                var cb = document.getElementById('cnt-bad'); if (cb) cb.textContent = d.badPassword;
 
                 var pill = document.getElementById('pill');
                 var pillText = document.getElementById('pill-text');
